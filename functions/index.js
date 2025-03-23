@@ -21,60 +21,57 @@ app.use(express.json());
 // Create a new user
 app.post("/users", async (req, res) => {
   try {
-    const { email, password, displayName, firstName, lastName } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+    // Get the Bearer token from the request headers
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .json({ error: "No authentication token provided" });
     }
 
-    console.log(`Attempting to create user with email: ${email}`);
+    const idToken = authHeader.split("Bearer ")[1];
 
-    // Create the user in Firebase Authentication
-    try {
-      const userRecord = await admin.auth().createUser({
+    // Verify the Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const uid = decodedToken.uid;
+
+    // Get user data from request body
+    const { email, username, firstName, lastName, displayName } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    // Update the user's display name in Firebase Auth (optional)
+    const userDisplayName =
+      displayName ||
+      `${firstName || ""} ${lastName || ""}`.trim() ||
+      email.split("@")[0];
+
+    await admin.auth().updateUser(uid, {
+      displayName: userDisplayName,
+    });
+
+    // Save additional user data in Firestore
+    await db
+      .collection("users")
+      .doc(uid)
+      .set({
         email,
-        password,
-        displayName:
-          displayName ||
-          `${firstName || ""} ${lastName || ""}`.trim() ||
-          email.split("@")[0],
+        username,
+        firstName: firstName || "",
+        lastName: lastName || "",
+        displayName: userDisplayName,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      console.log(`User created with UID: ${userRecord.uid}`);
-
-      // Save additional user data in Firestore
-      await db
-        .collection("users")
-        .doc(userRecord.uid)
-        .set({
-          email,
-          firstName: firstName || "",
-          lastName: lastName || "",
-          displayName:
-            displayName ||
-            `${firstName || ""} ${lastName || ""}`.trim() ||
-            email.split("@")[0],
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-      res.status(201).json({
-        success: true,
-        userId: userRecord.uid,
-        message: "User created successfully",
-      });
-    } catch (authError) {
-      console.error("Firebase Auth error:", authError);
-      if (authError.code === "auth/configuration-not-found") {
-        return res.status(500).json({
-          error:
-            "Authentication service misconfigured. Please check that Email/Password authentication is enabled in the Firebase Console.",
-        });
-      }
-
-      throw authError;
-    }
+    res.status(201).json({
+      success: true,
+      userId: uid,
+      message: "User profile created successfully",
+    });
   } catch (error) {
-    console.error("Error creating user:", error);
+    console.error("Error creating user profile:", error);
     res.status(500).json({
       error: error.message,
       code: error.code || "unknown",
