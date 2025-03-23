@@ -19,7 +19,6 @@ app.use(express.json());
 // ============= USER ROUTES =============
 
 // Create a new user
-// Create a new user
 app.post("/users", async (req, res) => {
   try {
     const { email, password, displayName, firstName, lastName } = req.body;
@@ -118,6 +117,38 @@ app.get("/users/:userId", async (req, res) => {
     });
   } catch (error) {
     console.error("Error getting user:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/users/by-username", async (req, res) => {
+  try {
+    const { username } = req.body;
+
+    if (!username) {
+      return res.status(400).json({ error: "Username is required" });
+    }
+
+    // Query Firestore to find a user with this username
+    const usersRef = db.collection("users");
+    const snapshot = await usersRef
+      .where("username", "==", username)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Return only the email (not the whole user object for security)
+    const userData = snapshot.docs[0].data();
+
+    res.status(200).json({
+      success: true,
+      email: userData.email,
+    });
+  } catch (error) {
+    console.error("Error finding user by username:", error);
     res.status(500).json({ error: error.message });
   }
 });
