@@ -1,0 +1,58 @@
+# .github/workflows/deploy.yml
+
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main # Change this to your main branch name if different (e.g., master)
+  pull_request:
+    types: [closed]
+    branches:
+      - main # Change this to your main branch name if different
+
+jobs:
+  deploy:
+    # Only run this job if the PR was merged (not just closed)
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18" # Adjust to your Node.js version
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      # Optional - Build step if you have a build process
+      - name: Build
+        run: npm run build
+
+      # Deploy to Firebase
+      - name: Deploy to Firebase
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: "${{ secrets.GITHUB_TOKEN }}"
+          firebaseServiceAccount: "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}"
+          projectId: your-firebase-project-id # Replace with your Firebase project ID
+          channelId: live
+          target: backend # Adjust if you have specific Firebase targets
+
+      # Send deployment notification
+      - name: Notify deployment status
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: always() # Run even if previous steps failed
