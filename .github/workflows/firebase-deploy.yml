@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "functions/**"
+      - 'functions/**'
 
 jobs:
   deploy_functions:
@@ -13,19 +13,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-
+      
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: "18"
-
+          node-version: '18'
+          
       - name: Install dependencies
         working-directory: ./functions
         run: npm ci
-
+      
       - name: Create SA key file
         run: echo '${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}' > ${{ github.workspace }}/gcp-sa-key.json
-
+      
       - name: Deploy to Firebase
         uses: w9jds/firebase-action@master
         with:
