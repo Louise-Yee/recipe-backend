@@ -2,35 +2,110 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const express = require("express");
 const cors = require("cors");
+const cookieParser = require("cookie-parser");
 
 // Initialize Firebase Admin
 admin.initializeApp();
 
 // Initialize Firestore database
 const db = admin.firestore();
-const cookieParser = require("cookie-parser");
+
 // Initialize Express app
 const app = express();
 
 // Middleware
-app.use(cookieParser());
-app.use(cors({ origin: true }));
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+app.use(cookieParser());
+
+// Helper function to get token from request (cookie or header)
+const getTokenFromRequest = (req) => {
+  // First try to get token from cookie
+  let token = req.cookies?.auth_token;
+
+  // If no cookie, fall back to Bearer token
+  if (!token) {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.split("Bearer ")[1];
+    }
+  }
+
+  return token;
+};
+
+// ============= AUTH ROUTES =============
+
+// Create session with HttpOnly cookie
+app.post("/auth/session", async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ error: "ID token is required" });
+    }
+
+    // Verify the Firebase token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
+
+    // Get user data from Firestore
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Set HttpOnly, Secure cookie with the token
+    res.cookie("auth_token", idToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 3600000, // 1 hour
+    });
+
+    // Return user data
+    res.status(200).json({
+      success: true,
+      user: {
+        uid: userId,
+        email: userDoc.data().email,
+        displayName: userDoc.data().displayName || "",
+        username: userDoc.data().username || userDoc.data().email.split("@")[0],
+        profileImage: userDoc.data().profileImage || "",
+        bio: userDoc.data().bio || "",
+        followersCount: userDoc.data().followersCount || 0,
+        followingCount: userDoc.data().followingCount || 0,
+        recipesCount: userDoc.data().recipesCount || 0,
+        firstName: userDoc.data().firstName || "",
+        lastName: userDoc.data().lastName || "",
+        createdAt: userDoc.data().createdAt,
+      },
+    });
+  } catch (error) {
+    console.error("Error creating session:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Logout endpoint to clear cookie
+app.post("/auth/logout", (req, res) => {
+  res.clearCookie("auth_token");
+  res.status(200).json({ success: true, message: "Logged out successfully" });
+});
 
 // ============= USER ROUTES =============
 
 // Create a new user
 app.post("/users", async (req, res) => {
   try {
-    // Get the Bearer token from the request headers
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
       return res
         .status(401)
         .json({ error: "No authentication token provided" });
     }
-
-    const idToken = authHeader.split("Bearer ")[1];
 
     // Verify the Firebase ID token
     const decodedToken = await admin.auth().verifyIdToken(idToken);
@@ -85,8 +160,8 @@ app.get("/users/:userId", async (req, res) => {
   try {
     const userId = req.params.userId;
 
-    // Verify the request has a valid Firebase ID token
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
     if (!idToken) {
       return res
         .status(401)
@@ -154,10 +229,8 @@ app.post("/users/by-username", async (req, res) => {
 // Update user profile
 app.put("/users/profile", async (req, res) => {
   try {
-    // Verify authentication
-    const idToken = req.headers.authorization
-      ? req.headers.authorization.split("Bearer ")[1]
-      : null;
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
     if (!idToken) {
       return res
         .status(401)
@@ -233,15 +306,8 @@ app.post("/login", async (req, res) => {
 // Get current user information
 app.get("/me", async (req, res) => {
   try {
-    // Get token from cookie instead of header
-    let token = req.cookies.auth_token;
-
-    if (!token) {
-      const authHeader = req.headers.authorization;
-      if (authHeader && authHeader.startsWith("Bearer ")) {
-        token = authHeader.split("Bearer ")[1];
-      }
-    }
+    // Get token from request (cookie or header)
+    const token = getTokenFromRequest(req);
 
     if (!token) {
       return res
@@ -288,8 +354,8 @@ app.get("/me", async (req, res) => {
 // Create a new recipe
 app.post("/recipes", async (req, res) => {
   try {
-    // Verify authentication
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
     if (!idToken) {
       return res
         .status(401)
@@ -409,8 +475,8 @@ app.get("/recipes/:recipeId", async (req, res) => {
 // Update a recipe
 app.put("/recipes/:recipeId", async (req, res) => {
   try {
-    // Verify authentication
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
     if (!idToken) {
       return res
         .status(401)
@@ -475,8 +541,8 @@ app.put("/recipes/:recipeId", async (req, res) => {
 // Delete a recipe
 app.delete("/recipes/:recipeId", async (req, res) => {
   try {
-    // Verify authentication
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
     if (!idToken) {
       return res
         .status(401)
