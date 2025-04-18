@@ -8,11 +8,12 @@ admin.initializeApp();
 
 // Initialize Firestore database
 const db = admin.firestore();
-
+const cookieParser = require("cookie-parser");
 // Initialize Express app
 const app = express();
 
 // Middleware
+app.use(cookieParser());
 app.use(cors({ origin: true }));
 app.use(express.json());
 
@@ -232,18 +233,24 @@ app.post("/login", async (req, res) => {
 // Get current user information
 app.get("/me", async (req, res) => {
   try {
-    // Verify authentication
-    const idToken = req.headers.authorization
-      ? req.headers.authorization.split("Bearer ")[1]
-      : null;
-    if (!idToken) {
+    // Get token from cookie instead of header
+    let token = req.cookies.auth_token;
+
+    if (!token) {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        token = authHeader.split("Bearer ")[1];
+      }
+    }
+
+    if (!token) {
       return res
         .status(401)
-        .json({ error: "Unauthorized - No token provided" });
+        .json({ error: "Unauthorized - Not authenticated" });
     }
 
     // Verify the token
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const decodedToken = await admin.auth().verifyIdToken(token);
     const userId = decodedToken.uid;
 
     // Get user data from Firestore
@@ -261,6 +268,12 @@ app.get("/me", async (req, res) => {
         firstName: userDoc.data().firstName || "",
         lastName: userDoc.data().lastName || "",
         displayName: userDoc.data().displayName || "",
+        username: userDoc.data().username || userDoc.data().email.split("@")[0],
+        profileImage: userDoc.data().profileImage || "",
+        bio: userDoc.data().bio || "",
+        followersCount: userDoc.data().followersCount || 0,
+        followingCount: userDoc.data().followingCount || 0,
+        recipesCount: userDoc.data().recipesCount || 0,
         createdAt: userDoc.data().createdAt,
       },
     });
