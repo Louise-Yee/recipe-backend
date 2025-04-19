@@ -41,7 +41,7 @@ functions/
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/recipe-backend.git
+   git clone https://github.com/Louise-Yee/recipe-backend.git
    cd recipe-backend
    ```
 
