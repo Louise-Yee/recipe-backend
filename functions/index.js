@@ -3,15 +3,77 @@ const admin = require("firebase-admin");
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
-// const multer = require("multer");
-const { v4: uuidv4 } = require("uuid");
-const path = require("path");
-const Busboy = require("busboy");
-const os = require("os");
-const fs = require("fs");
+const { v4: uuidv4 } = require("uuid"); // Add this for generating unique filenames
 
+// Initialize Firebase Admin
+admin.initializeApp({
+  credential: admin.credential.applicationDefault(),
+  storageBucket: "cloud-recipe-coursework.firebasestorage.app",
+});
+
+// Initialize Firestore database
+const db = admin.firestore();
+
+// Initialize Firebase Storage with explicit bucket name
+const storage = admin.storage();
+const bucket = storage.bucket("cloud-recipe-coursework.firebasestorage.app");
+
+// Initialize Express app
+const app = express();
+
+// Simple in-memory rate limiting (production would use Redis)
+const rateLimit = {
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  maxRequests: 100, // limit each IP to 100 requests per windowMs
+  message: "Too many requests from this IP, please try again later",
+  ipCache: new Map(),
+};
+
+// Rate limiting middleware
+const rateLimiter = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+
+  if (!rateLimit.ipCache.has(ip)) {
+    rateLimit.ipCache.set(ip, {
+      count: 1,
+      resetTime: now + rateLimit.windowMs,
+    });
+    return next();
+  }
+
+  const client = rateLimit.ipCache.get(ip);
+
+  // Reset if window expired
+  if (now > client.resetTime) {
+    client.count = 1;
+    client.resetTime = now + rateLimit.windowMs;
+    return next();
+  }
+
+  // Check count against limit
+  if (client.count >= rateLimit.maxRequests) {
+    return res.status(429).json({ error: rateLimit.message });
+  }
+
+  // Increment and continue
+  client.count++;
+  return next();
+};
+
+// Clean expired entries from cache periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of rateLimit.ipCache.entries()) {
+    if (now > data.resetTime) {
+      rateLimit.ipCache.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000); // Run every 5 minutes
+
+// CORS options
 const corsOptions = {
-  origin: true, // This will reflect the request origin
+  origin: ["https://cloud-recipe-coursework.web.app", "http://localhost:3000"], // Updated to include frontend domain
   credentials: true, // This is crucial for cookies
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: [
@@ -30,25 +92,11 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// Initialize Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.applicationDefault(),
-  storageBucket: "cloud-recipe-coursework.firebasestorage.app",
-});
-
-// Initialize Firestore database
-const db = admin.firestore();
-// Initialize Storage bucket
-const bucket = admin.storage().bucket();
-// Initialize Express app
-const app = express();
-
-// Middleware setup - order is important
-app.use(cors(corsOptions)); // CORS should be first
-app.options("*", cors(corsOptions));
-
+// Middleware
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
+app.use(rateLimiter);
 
 // Set up multer for handling file uploads
 // const storage = multer.memoryStorage();
@@ -70,6 +118,90 @@ const getTokenFromRequest = (req) => {
   }
 
   return token;
+};
+
+// Helper function to generate upload URL for image upload
+const generateUploadUrl = async (folderPath, fileName, contentType) => {
+  try {
+    // Generate a unique filename to avoid collisions
+    const uniqueFileName = `${folderPath}/${Date.now()}_${uuidv4()}_${fileName}`;
+
+    // Create a reference to the file in Firebase Storage
+    const file = bucket.file(uniqueFileName);
+
+    // Set metadata for the file
+    const fileMetadata = {
+      contentType: contentType,
+      firebaseStorageDownloadTokens: uuidv4(),
+    };
+
+    // Apply the metadata to the file
+    await file.setMetadata({
+      contentType,
+      metadata: fileMetadata,
+    });
+
+    // Create a signed URL for direct upload with proper configuration
+    const [signedUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: Date.now() + 15 * 60 * 1000, // 15 minutes
+      contentType: contentType,
+      // Ensure proper CORS headers for the upload
+      headers: {
+        "Content-Type": contentType,
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+
+    // Create a signed URL for reading to verify the upload later
+    const [downloadSignedUrl] = await file.getSignedUrl({
+      version: "v4",
+      action: "read",
+      expires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
+    });
+
+    // For direct access after upload (public URL)
+    const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${
+      bucket.name
+    }/o/${encodeURIComponent(uniqueFileName)}?alt=media`;
+
+    // Return both URLs
+    return {
+      uploadUrl: signedUrl,
+      fileUrl: downloadUrl,
+      verificationUrl: downloadSignedUrl,
+      fileName: uniqueFileName,
+    };
+  } catch (error) {
+    console.error("Error generating upload URL:", error);
+    throw error;
+  }
+};
+
+// Helper function to validate file size and type
+const validateImageFile = (contentType, fileSize) => {
+  // Check if content type is valid image
+  const validImageTypes = [
+    "image/jpeg",
+    "image/png",
+    "image/jpg",
+    "image/webp",
+  ];
+  if (!validImageTypes.includes(contentType)) {
+    return {
+      valid: false,
+      error: "Invalid file type. Only JPEG, PNG, GIF, and WEBP are allowed.",
+    };
+  }
+
+  // Check if file size is reasonable (limit to 5MB)
+  const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+  if (fileSize > MAX_SIZE) {
+    return { valid: false, error: "File too large. Maximum size is 5MB." };
+  }
+
+  return { valid: true };
 };
 
 // ============= AUTH ROUTES =============
@@ -129,6 +261,59 @@ app.post("/auth/session", async (req, res) => {
   }
 });
 
+// Refresh session and extend cookie lifetime
+// Refresh session and extend cookie lifetime
+app.post("/auth/refresh", async (req, res) => {
+  try {
+    const { idToken, requestCrossSiteCookies } = req.body;
+
+    // If no token in body, try to get from cookie
+    let token = idToken;
+    if (!token) {
+      token = getTokenFromRequest(req);
+    }
+
+    if (!token) {
+      return res
+        .status(401)
+        .json({ error: "No authentication token provided" });
+    }
+
+    // Verify the token
+    await admin.auth().verifyIdToken(token);
+
+    // Cookie options
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production" || requestCrossSiteCookies,
+      maxAge: 3600000, // 1 hour
+    };
+
+    // If cross-site cookies are requested, use SameSite=None (requires Secure)
+    if (requestCrossSiteCookies) {
+      cookieOptions.sameSite = "none";
+    } else {
+      cookieOptions.sameSite = "strict";
+    }
+
+    // Set a new cookie with the refreshed token
+    res.cookie("auth_token", token, cookieOptions);
+
+    res.status(200).json({
+      success: true,
+      message: "Session refreshed successfully",
+    });
+  } catch (error) {
+    console.error("Error refreshing session:", error);
+    // Clear the invalid cookie if there's an error
+    res.clearCookie("auth_token");
+    res.status(401).json({
+      error: "Session expired or invalid",
+      message: error.message,
+    });
+  }
+});
+
 // Logout endpoint to clear cookie
 app.post("/auth/logout", (req, res) => {
   res.clearCookie("auth_token");
@@ -136,6 +321,159 @@ app.post("/auth/logout", (req, res) => {
 });
 
 // ============= USER ROUTES =============
+
+// Get all users (only returns IDs)
+app.get("/users", async (req, res) => {
+  try {
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized - No token provided" });
+    }
+
+    // Verify the token
+    await admin.auth().verifyIdToken(idToken);
+
+    const usersSnapshot = await db.collection("users").get();
+
+    const users = [];
+    usersSnapshot.forEach((doc) => {
+      users.push({
+        id: doc.id,
+        username: doc.data().username || "",
+        displayName: doc.data().displayName || "",
+      });
+    });
+
+    res.status(200).json({
+      success: true,
+      users,
+      count: users.length,
+    });
+  } catch (error) {
+    console.error("Error getting users:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get public user profile - NEW ENDPOINT
+app.get("/users/public/:userId", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+
+    // Get token from request (still require authentication)
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized - No token provided" });
+    }
+
+    // Verify the token (any authenticated user can access)
+    await admin.auth().verifyIdToken(idToken);
+
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Get user's recipes
+    const recipesSnapshot = await db
+      .collection("recipes")
+      .where("authorId", "==", userId)
+      .orderBy("createdAt", "desc")
+      .get();
+
+    const recipes = [];
+    recipesSnapshot.forEach((doc) => {
+      recipes.push({
+        id: doc.id,
+        ...doc.data(),
+      });
+    });
+
+    // Return only public user data
+    const userData = {
+      id: userId,
+      username: userDoc.data().username || "",
+      displayName: userDoc.data().displayName || "",
+      profileImage: userDoc.data().profileImage || "",
+      bio: userDoc.data().bio || "",
+      recipesCount: recipes.length,
+    };
+
+    res.status(200).json({
+      success: true,
+      userData: userData,
+      recipes: recipes,
+    });
+  } catch (error) {
+    console.error("Error getting public user profile:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Search users by username or displayName
+app.get("/users/search", async (req, res) => {
+  try {
+    const { query } = req.query;
+
+    if (!query) {
+      return res.status(400).json({ error: "Search query is required" });
+    }
+
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized - No token provided" });
+    }
+
+    // Verify the token
+    await admin.auth().verifyIdToken(idToken);
+
+    const usersRef = db.collection("users");
+    const searchValue = query.toLowerCase();
+
+    // Get all users, we'll filter them on the server side
+    const snapshot = await usersRef.orderBy("username").limit(100).get();
+
+    // Combine and deduplicate results
+    const userMap = new Map();
+
+    snapshot.forEach((doc) => {
+      const userData = doc.data();
+      const username = (userData.username || "").toLowerCase();
+      const displayName = (userData.displayName || "").toLowerCase();
+
+      // Check if username or displayName contains the search query
+      if (username.includes(searchValue) || displayName.includes(searchValue)) {
+        userMap.set(doc.id, {
+          id: doc.id,
+          username: userData.username,
+          displayName: userData.displayName || "",
+          profileImage: userData.profileImage || "",
+          bio: userData.bio || "",
+        });
+      }
+    });
+
+    const users = Array.from(userMap.values());
+
+    res.status(200).json({
+      success: true,
+      users,
+      count: users.length,
+    });
+  } catch (error) {
+    console.error("Error searching users:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Create a new user
 app.post("/users", async (req, res) => {
@@ -157,6 +495,23 @@ app.post("/users", async (req, res) => {
 
     if (!email) {
       return res.status(400).json({ error: "Email is required" });
+    }
+
+    if (!username) {
+      return res.status(400).json({ error: "Username is required" });
+    }
+
+    // Check if username already exists
+    const usernameQuery = await db
+      .collection("users")
+      .where("username", "==", username)
+      .get();
+
+    if (!usernameQuery.empty) {
+      return res.status(409).json({
+        error: "Username already taken",
+        code: "username-exists",
+      });
     }
 
     // Update the user's display name in Firebase Auth (optional)
@@ -225,9 +580,26 @@ app.get("/users/:userId", async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
+    // Get user's recipes
+    const recipesSnapshot = await db
+      .collection("recipes")
+      .where("authorId", "==", userId)
+      .orderBy("createdAt", "desc")
+      .get();
+
+    const recipes = [];
+    recipesSnapshot.forEach((doc) => {
+      recipes.push({
+        id: doc.id,
+        ...doc.data(),
+      });
+    });
+
     res.status(200).json({
       success: true,
       userData: userDoc.data(),
+      recipes: recipes,
+      recipesCount: recipes.length,
     });
   } catch (error) {
     console.error("Error getting user:", error);
@@ -390,217 +762,263 @@ app.get("/me", async (req, res) => {
   }
 });
 
-// ============= RECIPE ROUTES =============
+// ============= IMAGE UPLOAD ROUTES =============
 
-// Upload image to Firebase Storage
-app.post("/upload-image", (req, res) => {
-  console.log("Direct upload request received");
-
-  if (!req.headers["content-type"]) {
-    return res.status(400).json({ error: "No content-type header provided" });
-  }
-
-  // Create a temporary directory to store the file
-  const tmpdir = os.tmpdir();
-  const fields = {};
-  let fileWrites = [];
-  let tmpFilePath = null;
-  let fileData = null;
-
-  // Create busboy instance
-  const busboy = Busboy({ headers: req.headers });
-
-  // Handle normal field values
-  busboy.on("field", (fieldname, val) => {
-    fields[fieldname] = val;
-  });
-
-  // Handle file upload
-  busboy.on("file", (fieldname, file, { filename, encoding, mimeType }) => {
-    console.log(`Processing file: ${filename}, type: ${mimeType}`);
-
-    if (!filename) {
-      console.log("No file provided");
-      return;
-    }
-
-    // Only accept images
-    if (!mimeType.startsWith("image/")) {
-      console.log(`Invalid file type: ${mimeType}`);
-      file.resume(); // Skip this file
-      return;
-    }
-
-    // Create a unique temp file path
-    const uniqueFilename = `${Date.now()}-${filename}`;
-    tmpFilePath = path.join(tmpdir, uniqueFilename);
-
-    fileData = {
-      fieldname,
-      originalname: filename,
-      encoding,
-      mimetype: mimeType,
-      filepath: tmpFilePath,
-    };
-
-    console.log(`Saving to temp file: ${tmpFilePath}`);
-
-    // Create write stream to temp file
-    const writeStream = fs.createWriteStream(tmpFilePath);
-    file.pipe(writeStream);
-
-    // Add promise to track file write completion
-    const promise = new Promise((resolve, reject) => {
-      file.on("end", () => {
-        writeStream.end();
-      });
-
-      writeStream.on("finish", () => {
-        console.log(`File write completed: ${tmpFilePath}`);
-        resolve();
-      });
-
-      writeStream.on("error", (error) => {
-        console.error(`Error writing file: ${error}`);
-        reject(error);
-      });
-    });
-
-    fileWrites.push(promise);
-  });
-
-  // Handle completion
-  busboy.on("finish", async () => {
-    console.log("Busboy processing finished");
-
-    try {
-      // Wait for all file writes to complete
-      await Promise.all(fileWrites);
-
-      // If no file was provided
-      if (!tmpFilePath || !fileData) {
-        return res
-          .status(400)
-          .json({ error: "No valid image file was provided" });
-      }
-
-      // Get and verify authentication token
-      const token = getTokenFromRequest(req);
-      if (!token) {
-        return res
-          .status(401)
-          .json({ error: "Unauthorized - No authentication token found" });
-      }
-
-      // Verify the token
-      const decodedToken = await admin.auth().verifyIdToken(token);
-      const userId = decodedToken.uid;
-
-      // Create a unique filename
-      const fileExtension = path.extname(fileData.originalname).toLowerCase();
-      const uniqueFilename = `${uuidv4()}${fileExtension}`;
-      const storageFilePath = `recipe-images/${userId}/${uniqueFilename}`;
-
-      console.log(`Uploading to Firebase Storage: ${storageFilePath}`);
-
-      // Upload directly to Firebase Storage using the file
-      const [uploadedFile] = await bucket.upload(tmpFilePath, {
-        destination: storageFilePath,
-        metadata: {
-          contentType: fileData.mimetype,
-          metadata: {
-            originalname: fileData.originalname,
-            uploadedBy: userId,
-            uploadedAt: new Date().toISOString(),
-          },
-        },
-      });
-
-      console.log("File successfully uploaded to Firebase Storage");
-
-      // Make the file publicly accessible
-      await uploadedFile.makePublic();
-
-      // Get the public URL
-      const publicUrl = `https://storage.googleapis.com/${bucket.name}/${storageFilePath}`;
-
-      // Clean up - delete temp file
-      try {
-        fs.unlinkSync(tmpFilePath);
-        console.log(`Temp file deleted: ${tmpFilePath}`);
-      } catch (err) {
-        console.error(`Error deleting temp file: ${err}`);
-        // Continue even if cleanup fails
-      }
-
-      // Return success response
-      return res.status(200).json({
-        success: true,
-        imageUrl: publicUrl,
-        message: "Image uploaded successfully",
-        fileInfo: {
-          originalname: fileData.originalname,
-          mimetype: fileData.mimetype,
-          size: fs.statSync(tmpFilePath).size,
-        },
-      });
-    } catch (error) {
-      console.error("Error in upload process:", error);
-
-      // Clean up temp file if it exists and there was an error
-      if (tmpFilePath) {
-        try {
-          fs.unlinkSync(tmpFilePath);
-          console.log(`Temp file deleted after error: ${tmpFilePath}`);
-        } catch (cleanupErr) {
-          console.error(`Error deleting temp file: ${cleanupErr}`);
-        }
-      }
-
-      return res.status(500).json({
-        error: "Server error during upload",
-        message: error.message,
-      });
-    }
-  });
-
-  // Handle busboy errors
-  busboy.on("error", (error) => {
-    console.error("Busboy error:", error);
-    return res.status(500).json({
-      error: "Error processing upload",
-      message: error.message,
-    });
-  });
-
-  // Pipe request to busboy for processing
-  req.pipe(busboy);
-});
-
-// Add this helper function to delete images
-const deleteImageFromUrl = async (imageUrl) => {
+// Generate upload URL for profile image
+app.post("/users/profile-image-upload-url", async (req, res) => {
   try {
-    if (!imageUrl) return;
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized - No token provided" });
+    }
 
-    const urlParts = imageUrl.split(
-      `https://storage.googleapis.com/${bucket.name}/`
+    // Verify the token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
+
+    const { fileName, contentType, fileSize } = req.body;
+
+    if (!fileName || !contentType || !fileSize) {
+      return res.status(400).json({
+        error:
+          "Missing required fields. Please provide fileName, contentType and fileSize",
+      });
+    }
+
+    // Validate the image file
+    const validation = validateImageFile(contentType, fileSize);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    // Generate the upload URL with the user ID in the path
+    const folderPath = `profile-images/${userId}`;
+    const uploadInfo = await generateUploadUrl(
+      folderPath,
+      fileName,
+      contentType
     );
 
-    if (urlParts.length !== 2) return;
+    // Store pending file info in the user's document
+    await db
+      .collection("users")
+      .doc(userId)
+      .update({
+        pendingProfileImage: {
+          fileName: uploadInfo.fileName,
+          uploadUrl: uploadInfo.uploadUrl,
+          fileUrl: uploadInfo.fileUrl,
+          contentType: contentType,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      });
 
-    const filePath = urlParts[1];
-    const file = bucket.file(filePath);
-
-    // Check if file exists before deleting
-    const [exists] = await file.exists();
-    if (exists) {
-      await file.delete();
-      console.log(`Successfully deleted image: ${filePath}`);
-    }
+    res.status(200).json({
+      success: true,
+      uploadInfo: {
+        uploadUrl: uploadInfo.uploadUrl,
+        fileUrl: uploadInfo.fileUrl,
+        fileName: uploadInfo.fileName,
+      },
+    });
   } catch (error) {
-    console.error("Error deleting image:", error);
+    console.error("Error generating profile image upload URL:", error);
+    res.status(500).json({ error: error.message });
   }
-};
+});
+
+// Confirm profile image upload
+app.post("/users/confirm-profile-image", async (req, res) => {
+  try {
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized - No token provided" });
+    }
+
+    // Verify the token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
+
+    const { fileName } = req.body;
+
+    if (!fileName) {
+      return res.status(400).json({ error: "fileName is required" });
+    }
+
+    // Get user data to check if the pending image exists
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (
+      !userDoc.exists ||
+      !userDoc.data().pendingProfileImage ||
+      userDoc.data().pendingProfileImage.fileName !== fileName
+    ) {
+      return res
+        .status(400)
+        .json({ error: "No matching pending profile image found" });
+    }
+
+    const pendingProfileImage = userDoc.data().pendingProfileImage;
+
+    // Update the user's profile with the new image URL
+    await db.collection("users").doc(userId).update({
+      profileImage: pendingProfileImage.fileUrl,
+      pendingProfileImage: admin.firestore.FieldValue.delete(), // Remove the pending image
+    });
+
+    res.status(200).json({
+      success: true,
+      profileImageUrl: pendingProfileImage.fileUrl,
+      message: "Profile image updated successfully",
+    });
+  } catch (error) {
+    console.error("Error confirming profile image upload:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Generate upload URL for recipe image
+app.post("/recipes/image-upload-url", async (req, res) => {
+  try {
+    // Get token from request
+    const idToken = getTokenFromRequest(req);
+    if (!idToken) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized - No token provided" });
+    }
+
+    // Verify the token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
+
+    const { fileName, contentType, fileSize, recipeId } = req.body;
+
+    if (!fileName || !contentType || !fileSize) {
+      return res.status(400).json({
+        error:
+          "Missing required fields. Please provide fileName, contentType and fileSize",
+      });
+    }
+
+    // Validate the image file
+    const validation = validateImageFile(contentType, fileSize);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    // If recipeId is provided (for updating existing recipe), check ownership
+    if (recipeId) {
+      const recipeDoc = await db.collection("recipes").doc(recipeId).get();
+      if (recipeDoc.exists && recipeDoc.data().authorId !== userId) {
+        return res.status(403).json({
+          error: "Forbidden - You can only upload images for your own recipes",
+        });
+      }
+    }
+
+    // Generate the upload URL
+    const folderPath = `recipe-images/${userId}`;
+    const uploadInfo = await generateUploadUrl(
+      folderPath,
+      fileName,
+      contentType
+    );
+
+    res.status(200).json({
+      success: true,
+      uploadInfo: {
+        uploadUrl: uploadInfo.uploadUrl,
+        fileUrl: uploadInfo.fileUrl,
+        fileName: uploadInfo.fileName,
+      },
+    });
+  } catch (error) {
+    console.error("Error generating recipe image upload URL:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============= RECIPE ROUTES =============
+
+// Search recipes by title
+app.get("/recipes/search", async (req, res) => {
+  try {
+    const { query } = req.query;
+
+    if (!query) {
+      return res.status(400).json({ error: "Search query is required" });
+    }
+
+    const recipesRef = db.collection("recipes");
+    const searchValue = query.toLowerCase();
+
+    // First get all recipes, we'll filter them on the server side
+    const snapshot = await recipesRef.orderBy("title").limit(100).get();
+
+    const recipes = [];
+    const userIds = new Set();
+
+    // Filter recipes where the title contains the search term
+    snapshot.forEach((doc) => {
+      const recipeData = doc.data();
+      // Check if the title contains the search query (case insensitive)
+      if (
+        recipeData.title &&
+        recipeData.title.toLowerCase().includes(searchValue)
+      ) {
+        recipes.push({
+          id: doc.id,
+          ...recipeData,
+        });
+
+        if (recipeData.authorId) {
+          userIds.add(recipeData.authorId);
+        }
+      }
+    });
+
+    // Get author information for all recipes in a single batch
+    const authors = {};
+    if (userIds.size > 0) {
+      const userDocs = await Promise.all(
+        Array.from(userIds).map((uid) => db.collection("users").doc(uid).get())
+      );
+
+      userDocs.forEach((userDoc) => {
+        if (userDoc.exists) {
+          authors[userDoc.id] = {
+            id: userDoc.id,
+            displayName: userDoc.data().displayName || "",
+            username: userDoc.data().username || "",
+          };
+        }
+      });
+    }
+
+    // Add author info to recipes
+    const recipesWithAuthors = recipes.map((recipe) => ({
+      ...recipe,
+      author: authors[recipe.authorId] || { displayName: "Unknown" },
+    }));
+
+    res.status(200).json({
+      success: true,
+      recipes: recipesWithAuthors,
+      count: recipesWithAuthors.length,
+    });
+  } catch (error) {
+    console.error("Error searching recipes:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Create a new recipe
 app.post("/recipes", async (req, res) => {
   try {
@@ -787,15 +1205,8 @@ app.put("/recipes/:recipeId", async (req, res) => {
         .json({ error: "Forbidden - You can only update your own recipes" });
     }
 
-    const {
-      title,
-      description,
-      ingredients,
-      steps,
-      cookTime,
-      servings,
-      imageUrl,
-    } = req.body;
+    const { title, description, ingredients, steps, cookTime, servings } =
+      req.body;
 
     // Create update object
     const updateData = {
@@ -809,15 +1220,6 @@ app.put("/recipes/:recipeId", async (req, res) => {
     if (steps) updateData.steps = steps;
     if (cookTime !== undefined) updateData.cookTime = cookTime;
     if (servings !== undefined) updateData.servings = servings;
-
-    // Handle image URL updates - delete the old image if there's a new one
-    if (imageUrl !== undefined) {
-      // If the image URL has changed and there was an old image
-      if (imageUrl !== recipeDoc.data().imageUrl && recipeDoc.data().imageUrl) {
-        await deleteImageFromUrl(recipeDoc.data().imageUrl);
-      }
-      updateData.imageUrl = imageUrl;
-    }
 
     // Update the document
     await db.collection("recipes").doc(recipeId).update(updateData);
@@ -861,18 +1263,48 @@ app.delete("/recipes/:recipeId", async (req, res) => {
         .json({ error: "Forbidden - You can only delete your own recipes" });
     }
 
-    // Delete the associated image if it exists
-    if (recipeDoc.data().imageUrl) {
-      await deleteImageFromUrl(recipeDoc.data().imageUrl);
+    // Get the recipe data to check for image URL
+    const recipeData = recipeDoc.data();
+
+    try {
+      // First try to delete any associated image from Storage
+      if (recipeData.imageUrl) {
+        // Extract filename from the image URL
+        // Format: https://firebasestorage.googleapis.com/v0/b/BUCKET/o/PATH%2FFILENAME?alt=media
+        const urlPath = recipeData.imageUrl.split("?")[0];
+        const decodedPath = decodeURIComponent(urlPath.split("/o/")[1]);
+
+        if (decodedPath) {
+          const imageFile = bucket.file(decodedPath);
+
+          // Check if file exists before attempting deletion
+          const [exists] = await imageFile.exists();
+          if (exists) {
+            await imageFile.delete();
+            console.log(`Deleted image file: ${decodedPath}`);
+          }
+        }
+      }
+
+      // Then delete the recipe document
+      await db.collection("recipes").doc(recipeId).delete();
+
+      res.status(200).json({
+        success: true,
+        message: "Recipe and associated image deleted successfully",
+      });
+    } catch (storageError) {
+      console.error("Error deleting recipe image:", storageError);
+
+      // Even if image deletion fails, still delete the recipe document
+      await db.collection("recipes").doc(recipeId).delete();
+
+      res.status(200).json({
+        success: true,
+        message:
+          "Recipe deleted successfully, but there was an issue removing the associated image",
+      });
     }
-
-    // Delete the document
-    await db.collection("recipes").doc(recipeId).delete();
-
-    res.status(200).json({
-      success: true,
-      message: "Recipe and associated image deleted successfully",
-    });
   } catch (error) {
     console.error("Error deleting recipe:", error);
     res.status(500).json({ error: error.message });
